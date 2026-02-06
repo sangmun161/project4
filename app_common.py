@@ -85,30 +85,27 @@ AQI_COLS = ["o3_aqi", "no2_aqi", "co_aqi", "so2_aqi"]
 MEAN_COLS = ["o3_mean", "no2_mean", "co_mean", "so2_mean"]
 TARGET_OPTIONS = MEAN_COLS
 
-SITE_CLUSTER_MAP_5 = {
-    0: "moderate",
-    1: "risk",
+# =========================
+# Site Cluster (KMeans = 3)
+# =========================
+
+SITE_CLUSTER_LABELS_3 = {
+    0: "safe",
+    1: "moderate",
     2: "high-risk",
-    3: "safe",
-    4: "moderate-episodic",
 }
-SITE_CLUSTER_3LVL = {
-    "safe": "Stable",
-    "moderate": "Stable",
-    "risk": "Risk",
-    "moderate-episodic": "Risk",
-    "high-risk": "High-risk",
+
+CLUSTER_COLORS = {
+    "safe": "#2ca02c",
+    "moderate": "#ff7f0e",
+    "high-risk": "#d62728",
+    "Unknown": "#7f7f7f",
 }
+
 
 STATE_RISK_ICON = {"None": "", "Medium": "⚠", "High": "❗"}
 SPIKE_RISK_ICON = {"None": "—", "Watch": "🟡 Watch", "Warn": "🔴 Warn"}
 
-CLUSTER_COLORS = {
-    "Stable": "#2ca02c",
-    "Risk": "#ff7f0e",
-    "High-risk": "#d62728",
-    "Unknown": "#7f7f7f",
-}
 
 SPIKE_ICON_OFFSET = {
     "Watch": (0.05, -0.05),
@@ -361,9 +358,10 @@ def fit_site_cluster(
     df: pd.DataFrame,
     _day_km: KMeans,
     _day_scaler: StandardScaler,
-    n_clusters: int = 5,
+    n_clusters: int = 3,
     random_state: int = 42,
 ):
+
     work = df.dropna(subset=AQI_COLS).copy()
     X_day = _day_scaler.transform(work[AQI_COLS].values)
     work["day_cluster"] = _day_km.predict(X_day)
@@ -394,6 +392,8 @@ def attach_site_clusters(df: pd.DataFrame) -> pd.DataFrame:
     site_km, site_scaler = fit_site_cluster(df, day_km, day_scaler)
 
     work = df.dropna(subset=AQI_COLS).copy()
+
+    # day-cluster
     X_day = day_scaler.transform(work[AQI_COLS].values)
     work["day_cluster"] = day_km.predict(X_day)
     work["total_aqi"] = work[AQI_COLS].sum(axis=1)
@@ -403,7 +403,10 @@ def attach_site_clusters(df: pd.DataFrame) -> pd.DataFrame:
         .agg(
             mean_total_aqi=("total_aqi", "mean"),
             std_total_aqi=("total_aqi", "std"),
-            **{f"pct_day_cluster_{i}": ("day_cluster", lambda x, i=i: (x == i).mean()) for i in range(day_km.n_clusters)},
+            **{
+                f"pct_day_cluster_{i}": ("day_cluster", lambda x, i=i: (x == i).mean())
+                for i in range(day_km.n_clusters)
+            },
         )
         .reset_index()
         .fillna(0)
@@ -411,11 +414,26 @@ def attach_site_clusters(df: pd.DataFrame) -> pd.DataFrame:
 
     feat_cols = [c for c in site_feat.columns if c != "site"]
     Xs = site_scaler.transform(site_feat[feat_cols].values)
-    site_feat["cluster_k5"] = site_km.predict(Xs).astype(int)
-    site_feat["cluster_5name"] = site_feat["cluster_k5"].map(SITE_CLUSTER_MAP_5).fillna("risk")
-    site_feat["cluster_3name"] = site_feat["cluster_5name"].map(SITE_CLUSTER_3LVL).fillna("Risk")
 
-    return df.merge(site_feat[["site", "cluster_k5", "cluster_5name", "cluster_3name"]], on="site", how="left")
+    site_feat["cluster_k3"] = site_km.predict(Xs).astype(int)
+    site_feat["site_cluster"] = (
+        site_feat["cluster_k3"].map(SITE_CLUSTER_LABELS_3).fillna("moderate")
+    )
+
+    # ✅ 여기부터가 핵심: 기존 컬럼 충돌 방지
+    out = df.copy()
+
+    if "site_cluster" in out.columns:
+        out = out.rename(columns={"site_cluster": "site_cluster_src"})  # 원본 보존
+    if "cluster_k3" in out.columns:
+        out = out.rename(columns={"cluster_k3": "cluster_k3_src"})
+
+    return out.merge(
+        site_feat[["site", "cluster_k3", "site_cluster"]],
+        on="site",
+        how="left",
+    )
+
 
 
 # =========================
@@ -655,13 +673,18 @@ def compute_spike_risk_all_sites(
         state = str(today_row["state"].iloc[0]) if "state" in today_row.columns and pd.notna(today_row["state"].iloc[0]) else ""
         county = str(today_row["county"].iloc[0]) if "county" in today_row.columns and pd.notna(today_row["county"].iloc[0]) else ""
         city = str(today_row["city"].iloc[0]) if "city" in today_row.columns and pd.notna(today_row["city"].iloc[0]) else ""
-        cluster_3 = str(today_row["cluster_3name"].iloc[0]) if "cluster_3name" in today_row.columns and pd.notna(today_row["cluster_3name"].iloc[0]) else "Risk"
+        cluster_3 = (
+            str(today_row["site_cluster"].iloc[0]).lower().strip()
+            if "site_cluster" in today_row.columns and pd.notna(today_row["site_cluster"].iloc[0])
+            else "moderate"
+        )
+
 
         margin = (max_upper - max_thr) if (np.isfinite(max_upper) and np.isfinite(max_thr)) else np.nan
 
         rows.append({
             "site": site,
-            "cluster_3name": cluster_3,
+            "site_cluster": cluster_3,
             "lat": lat,
             "lon": lon,
             "state": state,

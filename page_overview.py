@@ -35,12 +35,48 @@ def _inject_delta_color_css():
     st.markdown(
         """
         <style>
-          /* 전역 *{color:... !important} 보다 class가 우선 */
-          .delta-pos { color: #EF4444 !important; }   /* + : 빨강 */
-          .delta-neg { color: #3B82F6 !important; }   /* - : 파랑 */
-          .delta-zero { color: #94A3B8 !important; }  /* 0 : 중립 */
-          .delta-na { color: #94A3B8 !important; }    /* N/A : 중립 */
+          /* 전역 *{color:... !important} 를 이기기 위해
+             main 영역 selector로 specificity 강화 */
+          [data-testid="stAppViewContainer"] [data-testid="stMain"] .delta-pos {
+            color: #EF4444 !important;   /* + : 빨강 */
+          }
+          [data-testid="stAppViewContainer"] [data-testid="stMain"] .delta-neg {
+            color: #3B82F6 !important;   /* - : 파랑 */
+          }
+          [data-testid="stAppViewContainer"] [data-testid="stMain"] .delta-zero {
+            color: #94A3B8 !important;   /* 0 : 중립 */
+          }
+          [data-testid="stAppViewContainer"] [data-testid="stMain"] .delta-na {
+            color: #94A3B8 !important;   /* N/A : 중립 */
+          }
         </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+def kpi_card_with_rule(title: str, value: str, rule: str):
+    st.markdown(
+        f"""
+        <div class="card" style="position:relative;">
+          <div class="kpi-wrap">
+            <div>
+              <div class="kpi-label">{title}</div>
+              <div class="kpi-value">{value}</div>
+            </div>
+          </div>
+
+          <!-- 기준 문구: 박스 안 가장자리(회색) -->
+          <div style="
+            position:absolute;
+            right:12px;
+            bottom:8px;
+            font-size:11px;
+            color:#9CA3AF;
+            letter-spacing:-0.2px;
+          ">
+            {rule}
+          </div>
+        </div>
         """,
         unsafe_allow_html=True,
     )
@@ -53,7 +89,7 @@ def _hover_text(row: pd.Series) -> str:
 
     return (
         f"<b>{row.get('site','-')}</b><br>"
-        f"Cluster: {row.get('cluster_3name','-')}<br>"
+        f"Cluster: {row.get('site_cluster','-')}<br>"
         f"Spike Days (7d): {int(row.get('spike_days', 0))}<br>"
         f"Priority: {row.get('priority','-')}<br>"
         f"{state} {county} {city}"
@@ -87,8 +123,8 @@ def build_map_figure(snap: pd.DataFrame, selected_site: str | None = None) -> go
                 )
             )
 
-    for cl in ["Stable", "Risk", "High-risk"]:
-        sub = s[s["cluster_3name"] == cl]
+    for cl in ["safe", "moderate", "high-risk"]:
+        sub = s[s["site_cluster"] == cl]
         if sub.empty:
             continue
 
@@ -121,17 +157,10 @@ def build_map_figure(snap: pd.DataFrame, selected_site: str | None = None) -> go
             zoom=4,
         ),
         height=MAP_HEIGHT_PX,
-        margin=dict(l=0, r=0, t=30, b=0),
-        legend=dict(
-            orientation="h",
-            x=0.5,
-            y=1.05,
-            xanchor="center",
-            yanchor="bottom",
-            bgcolor="rgba(255,255,255,0.6)",
-            borderwidth=0,
-            font=dict(size=12),
-        ),
+        margin=dict(l=0, r=0, t=0, b=0),
+        showlegend=False,
+        paper_bgcolor="rgba(0,0,0,0)",    
+        plot_bgcolor="rgba(0,0,0,0)",
     )
     return fig
 
@@ -252,6 +281,13 @@ def _top_right_quick_widgets(anchor_date: pd.Timestamp):
 def render_page1(df_all: pd.DataFrame, spike_df: pd.DataFrame, map_show_state: bool):
     base = df_all.sort_values("date").groupby("site", as_index=False).tail(1).copy()
     snap = base.merge(spike_df, on="site", how="left")
+    # ✅ site_cluster 보정 (없으면 df_all에서 다시 붙임)
+    if "site_cluster" not in snap.columns:
+        snap = snap.merge(
+            df_all[["site", "site_cluster"]].drop_duplicates(),
+            on="site",
+            how="left",
+        )
     snap["spike_days"] = snap["spike_days"].fillna(0).astype(int)
     snap["priority"] = snap["priority"].fillna("LOW")
 
@@ -308,15 +344,94 @@ def render_page1(df_all: pd.DataFrame, spike_df: pd.DataFrame, map_show_state: b
     # KPI
     k1, k2, k3 = st.columns(3)
     with k1:
-        kpi_card("❗즉시 대응", str((snap["priority"] == "HIGH").sum()))
+        kpi_card("❗즉시 대응", str((snap["priority"] == "HIGH").sum()), "스파이크 ≥ 9개")
     with k2:
-        kpi_card("🟠우선 검토", str((snap["priority"] == "MEDIUM").sum()))
+        kpi_card("🟠우선 검토", str((snap["priority"] == "MEDIUM").sum()), "스파이크 6–8개")
     with k3:
-        kpi_card("🟢일반 모니터링", str((snap["priority"] == "LOW").sum()))
+        kpi_card("🟢일반 모니터링", str((snap["priority"] == "LOW").sum()), "스파이크 ≤ 5개")
+    
+
+    
+
+    left, right = st.columns([3.2, 1.2], gap="large")
 
     left, right = st.columns([3.2, 1.2], gap="large")
 
     with left:
+        # ===============================
+        # 1×4 오염지표 값 + 전일 대비 변화율 (지도와 동일 가로폭)
+        # ===============================
+        BASE_DATE = pd.Timestamp("2023-12-31")
+
+        df_today = df_all[
+            (df_all["site"].astype(str) == str(selected_site)) &
+            (pd.to_datetime(df_all["date"]) == BASE_DATE)
+        ]
+
+        # fallback: 해당 날짜 없으면 최신 날짜 사용
+        if df_today.empty:
+            df_today = (
+                df_all[df_all["site"].astype(str) == str(selected_site)]
+                .sort_values("date")
+                .tail(1)
+            )
+            if not df_today.empty:
+                BASE_DATE = pd.to_datetime(df_today["date"].iloc[0])
+
+        if not df_today.empty:
+            row_today = df_today.iloc[0]
+            changes = compute_day_over_day_change(df_all, selected_site)
+
+            c1, c2, c3, c4 = st.columns(4, gap="large")
+
+            def _render_value_box(label, col):
+                v = row_today.get(col, np.nan)
+                d = changes.get(label)
+
+                # 값 포맷
+                v_txt = "N/A" if pd.isna(v) else f"{float(v):.3f}"
+
+                # 변화율 포맷
+                if d is None or (isinstance(d, float) and np.isnan(d)):
+                    cls, d_txt = "delta-na", "N/A"
+                elif d > 0:
+                    cls, d_txt = "delta-pos", f"+{d:.1f}%"
+                else:
+                    cls, d_txt = "delta-neg", f"{d:.1f}%"
+
+                st.markdown(
+                    f"""
+                    <div style="
+                    background:#FFFFFF;
+                    border-radius:16px;
+                    padding:18px;
+                    height:110px;
+                    box-shadow:0 2px 8px rgba(0,0,0,0.06);
+                    ">
+                    <div style="font-size:18px;font-weight:800;">{label}</div>
+                    <div style="margin-top:8px;font-size:26px;font-weight:900;">
+                        {v_txt}
+                        <span class="{cls}" style="font-size:16px;margin-left:8px;">
+                        {d_txt}
+                        </span>
+                    </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            with c1:
+                _render_value_box("O3", "o3_mean")
+            with c2:
+                _render_value_box("NO2", "no2_mean")
+            with c3:
+                _render_value_box("CO", "co_mean")
+            with c4:
+                _render_value_box("SO2", "so2_mean")
+
+        # ===============================
+        # 지도
+        # ===============================
         fig = build_map_figure(snap, selected_site)
         event = st.plotly_chart(
             fig,
@@ -335,6 +450,7 @@ def render_page1(df_all: pd.DataFrame, spike_df: pd.DataFrame, map_show_state: b
 
         card_end()
 
+
     with right:
         sel = st.selectbox(
             "관측소 선택",
@@ -345,28 +461,10 @@ def render_page1(df_all: pd.DataFrame, spike_df: pd.DataFrame, map_show_state: b
         row = snap[snap["site"] == sel].iloc[0]
 
         st.write(f"**{row['site']}**")
-        st.write(f"- 종합오염지표: **{row['cluster_3name']}**")
+        st.write(f"- 종합오염지표: **{row['site_cluster']}**")
         st.write(f"- 예측위험지수: **{row['priority']}**")
         st.write(f"- 스파이크 탐지 수: **{row['spike_days']}개**")
 
-        st.markdown("**전일 대비 변화율 (%)**")
-        changes = compute_day_over_day_change(df_all, sel)
-        dark = bool(st.session_state.get("ui_dark_mode", False))
-
-        r1c1, r1c2 = st.columns(2, gap="small")
-        r2c1, r2c2 = st.columns(2, gap="small")
-
-        with r1c1:
-            _render_delta_box("O3", changes.get("O3"), dark, mt_px=0, mb_px=DELTA_ROW1_MB_PX)
-        with r1c2:
-            _render_delta_box("NO2", changes.get("NO2"), dark, mt_px=0, mb_px=DELTA_ROW1_MB_PX)
-
-        with r2c1:
-            _render_delta_box("CO", changes.get("CO"), dark, mt_px=DELTA_ROW2_MT_PX, mb_px=0)
-        with r2c2:
-            _render_delta_box("SO2", changes.get("SO2"), dark, mt_px=DELTA_ROW2_MT_PX, mb_px=0)
-
-        # ✅ 4박스 ↔ 도넛 간격 조절
         st.markdown(
             f"<div style='margin-top:{DELTA_TO_DONUT_MT_PX}px;'></div>",
             unsafe_allow_html=True,

@@ -227,6 +227,15 @@ WEATHER_FEATURE_MEANING = {
     "pressure_pa": ("고기압 정체", "기압 혼합"),
     "temp_c": ("고온", "저온"),
 }
+# SHAP 조건 → 실제 기상 컬럼 매핑
+SHAP_REASON_TO_COLUMN = {
+    "풍속 조건": ("wind_speed", "풍속 (m/s)"),
+    "기온 조건": ("temp_c", "기온 (°C)"),
+    "기압 조건": ("pressure_pa", "기압 (Pa)"),
+    "습도 조건": ("humidity", "습도 (%)"),
+    "일사 조건": ("solar_radiation", "일사량"),
+}
+
 
 
 def explain_weather_keyword(model_key: str, model, X_row: pd.DataFrame) -> Optional[str]:
@@ -250,6 +259,110 @@ def explain_weather_keyword(model_key: str, model, X_row: pd.DataFrame) -> Optio
                 return WEATHER_FEATURE_MEANING[fkey][0 if val > 0 else 1]
     except Exception:
         return None
+    return None
+
+# ===============================
+# Event-level SHAP explanation
+# ===============================
+WEATHER_FEATURE_GROUPS = {
+    "wind": "풍속 조건",
+    "temp": "기온 조건",
+    "pressure": "기압 조건",
+    "humidity": "습도 조건",
+    "solar": "일사 조건",
+}
+# ===============================
+# Spatial context summarizer
+# ===============================
+def summarize_spatial_context(row: pd.Series) -> dict:
+    # 도시화 수준
+    if row["impervious_pct"] > 60:
+        urban_level = "고도시화"
+    elif row["impervious_pct"] > 40:
+        urban_level = "중간 도시화"
+    else:
+        urban_level = "저도시화"
+
+    # 도시 토지피복
+    if row["urban_landcover_pct"] > 0.9:
+        urban_cover = "도시 토지피복 지배"
+    else:
+        urban_cover = "혼합 토지피복"
+
+    # 고도
+    if row["elevation_mean"] > 500:
+        elevation = "고지대"
+    elif row["elevation_mean"] > 100:
+        elevation = "중간 고도"
+    else:
+        elevation = "저지대"
+
+    # 인공 구조 / 녹지 (컬럼 없으면 중립 처리)
+    ndbi = row.get("NDBI_mean", np.nan)
+    ndvi = row.get("NDVI_mean", np.nan)
+
+    if pd.notna(ndbi):
+        built_env = "인공 구조 우세" if ndbi > 0 else "자연·혼합 구조"
+    else:
+        built_env = "구조 정보 부족"
+
+    if pd.notna(ndvi):
+        green_env = "녹지 부족" if ndvi < 0.2 else "중간 이상 녹지"
+    else:
+        green_env = "녹지 정보 부족"
+
+    return {
+        "urban_level": urban_level,
+        "urban_cover": urban_cover,
+        "elevation": elevation,
+        "built_env": built_env,
+        "green_env": green_env,
+    }
+
+
+def explain_weather_keyword_event(
+    model_key: str,
+    model,
+    X_all: pd.DataFrame,
+    dates: pd.Series,
+    center_date: pd.Timestamp,
+    window: int = 1,
+) -> Optional[str]:
+    """
+    하루가 아닌 이벤트(±window일) 기준 SHAP 평균으로
+    '모델 판단에 기여한 기상 그룹'을 반환
+    """
+    explainer = get_shap_explainer(model_key, model)
+    if explainer is None:
+        return None
+
+    mask = (
+        (dates >= center_date - pd.Timedelta(days=window)) &
+        (dates <= center_date + pd.Timedelta(days=window))
+    )
+    X_evt = X_all.loc[mask]
+
+    if X_evt.empty:
+        return None
+
+    try:
+        sv = explainer(X_evt, check_additivity=False)
+        mean_shap = np.mean(sv.values, axis=0)
+    except Exception:
+        return None
+
+    ranked = sorted(
+        zip(X_evt.columns, mean_shap),
+        key=lambda x: abs(x[1]),
+        reverse=True,
+    )
+
+    for feat, _ in ranked:
+        fkey = feat.lower()
+        for group_key, group_name in WEATHER_FEATURE_GROUPS.items():
+            if group_key in fkey:
+                return group_name
+
     return None
 
 
@@ -376,6 +489,7 @@ def build_llm_payload(
     horizon: int,
     pollutant_summaries: List[dict],
     style_hint: str,
+    spatial_context: dict,
 ) -> List[dict]:
     sys = (
         "너는 대기환경 운영관리자 보조 AI다. "
@@ -383,12 +497,14 @@ def build_llm_payload(
         "출력은 반드시 JSON 형식이어야 하며,"
         "모든 value는 한국어 문장으로 작성하라."
         "영어 사용은 고유명사(단위, 기호 등)를 제외하고 금지한다."
+        "관측소의 공간적 특성(spatial_context)을 기상 요인과 함께 반드시 종합적으로 해석해라."
     )
     user = {
         "site": site,
         "anchor_date": str(anchor.date()),
         "horizon_days": horizon,
         "pollutant_summaries": pollutant_summaries,
+        "spatial_context": spatial_context,
         "style_hint": style_hint,
         "required_json_keys": [k for _, k in REPORT_SCHEMA_KEYS],
     }
@@ -485,6 +601,17 @@ def render_page2(
     # Data
     # ------------------------------
     df_site = df_all[df_all["site"].astype(str) == str(site)].sort_values("date").copy()
+    # 공간 요약용: 관측소 대표 1행 (공간 변수는 시간에 따라 변하지 않음)
+    if not df_site.empty and "site-cluster" in df_site.columns:
+        site_cluster = str(df_site.iloc[-1]["site-cluster"])
+    else:
+        site_cluster = "moderate"
+
+    if df_site.empty:
+        spatial_context = {}
+    else:
+        spatial_row = df_site.iloc[-1]
+        spatial_context = summarize_spatial_context(spatial_row)
 
     # ------------------------------
     # (A) SPIKE_DF 요약 (표시용) - 토글 없음, 항상 표시
@@ -604,10 +731,11 @@ def render_page2(
     # 상단 요약(표시용): SPIKE_DF 기반
     # ------------------------------
     st.info(
-        f"**요약:** 향후 {horizon}일 중 "
-        f"**{n_spike_summary}번** 스파이크 위험 "
+        f"**요약:** 본 관측소는 현재 **{site_cluster.upper()}** 상태이며, "
+        f"향후 {horizon}일 중 **{n_spike_summary}번** 스파이크 위험이 예측됩니다 "
         f"(우선순위: **{priority_summary}**)"
     )
+
 
     # ------------------------------
     # Main layout (원본 유지: 좌 2x2 / 우 AI 보고서)
@@ -678,7 +806,7 @@ def render_page2(
                         st.plotly_chart(fig2, use_container_width=True, config=PLOTLY_CFG)
 
                     # --- Cause analysis
-                    with st.expander("🔍 원인 분석", expanded=False):
+                    with st.expander("🔍 모델 판단에 기여한 요인", expanded=False):
                         if not spike_detail_available:
                             st.caption("미래 입력/모델이 없어서 원인 분석이 비활성화되었습니다.")
                         else:
@@ -689,30 +817,62 @@ def render_page2(
                                 st.caption("모델 피처를 확인할 수 없어 원인 분석이 불가합니다.")
                             else:
                                 X_all = df_future_site_filled[feats]
+                                date_series = df_future_site_filled["date"]
 
-                                # 1) 스파이크가 있으면 그 날짜들(최대 3개)
+                                # 1) 스파이크 발생일 기준
                                 if spike_days:
-                                    st.markdown("**스파이크(임계치 이상) 날짜 기준 원인:**")
+                                    st.markdown("**스파이크 발생 구간 기준(이벤트) 판단 요인:**")
                                     for d in spike_days[:3]:
-                                        X_row = X_all[df_future_site_filled["date"] == d]
-                                        reason = explain_weather_keyword(label, model, X_row) if not X_row.empty else None
-                                        st.markdown(
-                                            f"- **{pd.to_datetime(d).strftime('%Y-%m-%d')}**: {reason or '기상 영향 미약'}"
+                                        reason = explain_weather_keyword_event(
+                                            model_key=label,
+                                            model=model,
+                                            X_all=X_all,
+                                            dates=date_series,
+                                            center_date=pd.to_datetime(d),
+                                            window=1,
                                         )
+                                        st.markdown(
+                                            f"- **{pd.to_datetime(d).strftime('%Y-%m-%d')}**: "
+                                            f"{reason or '기상 요인 영향 미약'}"
+                                        )
+                                        # ===============================
+                                        # 📈 SHAP 결과 기반 미래 기상 그래프 (7일)
+                                        # ===============================
+                                        if reason in SHAP_REASON_TO_COLUMN:
+                                            col, label_kr = SHAP_REASON_TO_COLUMN[reason]
 
-                                # 2) 스파이크가 없으면 “위험 상위(확률 상위)” 날짜들로 보여줌
+                                            if col in df_future_site_filled.columns:
+                                                with st.expander(f"📈 {label_kr} 7일 예보", expanded=False):
+                                                    df_view = (
+                                                        df_future_site_filled
+                                                        .set_index("date")[[col]]
+                                                        .rename(columns={col: label_kr})
+                                                    )
+
+                                                    st.line_chart(df_view)
+                                            else:
+                                                st.caption(f"{label_kr} 데이터가 없습니다.")
+
+                                # 2) 스파이크 없으면 위험 상위일 기준
                                 else:
                                     if not top_risk_days:
                                         st.markdown("스파이크 위험이 매우 낮거나 예측 확률을 계산할 수 없습니다.")
                                     else:
-                                        st.markdown("**스파이크는 없지만, ‘위험 상위’ 날짜 기준 원인(Top 3):**")
+                                        st.markdown("**스파이크는 없으나, 위험 상위 구간 기준 판단 요인:**")
                                         for d, p in zip(top_risk_days, top_risk_probs):
-                                            X_row = X_all[df_future_site_filled["date"] == d]
-                                            reason = explain_weather_keyword(label, model, X_row) if not X_row.empty else None
+                                            reason = explain_weather_keyword_event(
+                                                model_key=label,
+                                                model=model,
+                                                X_all=X_all,
+                                                dates=date_series,
+                                                center_date=pd.to_datetime(d),
+                                                window=1,
+                                            )
                                             st.markdown(
                                                 f"- **{pd.to_datetime(d).strftime('%Y-%m-%d')}** "
-                                                f"(prob={p:.3f}): {reason or '기상 영향 미약'}"
+                                                f"(prob={p:.3f}): {reason or '기상 요인 영향 미약'}"
                                             )
+
 
     # ========== RIGHT: AI report (원본 유지) ==========
     with right:
@@ -751,7 +911,13 @@ def render_page2(
                     for i in top_idxs:
                         d = pd.to_datetime(df_future_site_filled.iloc[i]["date"])
                         X_row = X[df_future_site_filled["date"] == d]
-                        reason = explain_weather_keyword(label, model, X_row) if not X_row.empty else None
+                        reason = explain_weather_keyword_event(
+                            model_key = label,
+                            model = model,
+                            X_all = X,
+                            dates = df_future_site_filled["date"],
+                            center_date=d,
+                            window=1) if not X_row.empty else None
                         examples.append(f"{d:%Y-%m-%d} (prob={float(probs[i]):.3f}) - driver={reason or 'N/A'}")
 
                     pollutant_summaries.append(
@@ -774,7 +940,7 @@ def render_page2(
                         }
                     )
 
-            messages = build_llm_payload(site, anchor, horizon, pollutant_summaries, style_hint)
+            messages = build_llm_payload(site, anchor, horizon, pollutant_summaries, style_hint, spatial_context)
             try:
                 with st.spinner("GPT가 보고서를 작성 중입니다..."):
                     report_text = generate_report_from_llm(messages)
